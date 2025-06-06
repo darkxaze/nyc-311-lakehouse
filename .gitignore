@@ -1,0 +1,51 @@
+__pycache__/
+*.pyc
+*.pyo
+.env
+.venv/
+venv/
+*.egg-info/
+.DS_Store
+.pytest_cache/
+*.log
+dbt/target/
+dbt/logs/
+dbt/.user.yml
+dbt/dbt_packages/
+dbt/package-lock.yml
+.terraform/
+*.tfstate
+*.tfstate.backup
+benchmarks/*.json
+scraps/
+actual_build.md
+NYC_311_LAKEHOUSE_COMPLETE_BUILD_GUIDE.md
+nyc-311-lakehouse-dev_accessKeys.csv
+nyc-311-lakehouse-dev_credentials.csv
+*.parquet
+*.duckdb
+*.db
+.dlt/
+# AI tools
+.cursor/
+.cursorrules
+.aider*
+.claude/
+.ai/
+cursor.log
+CLAUDE.md
+CONTEXT.md
+
+# Cursor IDE
+.cursor/
+.vscode/
+*.code-workspace
+
+# Claude Code
+.claude/
+.anthropic/
+
+# AI chat history (if any gets saved locally)
+.ai/
+.aider*
+
