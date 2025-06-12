@@ -13,12 +13,13 @@ dbt/logs/
 dbt/.user.yml
 dbt/dbt_packages/
 dbt/package-lock.yml
+.checkpoints/
 .terraform/
 *.tfstate
 *.tfstate.backup
 benchmarks/*.json
 scraps/
-actual_build.md
+Actual_build.md
 NYC_311_LAKEHOUSE_COMPLETE_BUILD_GUIDE.md
 nyc-311-lakehouse-dev_accessKeys.csv
 nyc-311-lakehouse-dev_credentials.csv
