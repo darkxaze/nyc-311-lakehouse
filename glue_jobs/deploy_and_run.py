@@ -25,18 +25,33 @@ logs:DescribeLogStreams scoped to /aws-glue/jobs/error and
 /aws-glue/jobs/output) in addition to AWSGlueConsoleFullAccess,
 AmazonS3FullAccess, and the GlueRoleManagement PassRole policy.
 
+Format flags (mutually exclusive) select which Spark confs get attached
+and which Glue engine version is used:
+    --iceberg       Glue 4.0, glue_catalog only (raw_to_iceberg.py)
+    --iceberg-delta Glue 5.0, both glue_catalog (Iceberg read) and
+                     spark_catalog (Delta write) configured. Needed by
+                     any job reading an Iceberg source and writing Delta
+                     (iceberg_to_delta.py). Not UniForm-specific — this
+                     just wires up both catalogs; UniForm's automatic
+                     Iceberg conversion was evaluated and deferred (see
+                     DECISIONS.md — requires a real Hive Metastore,
+                     which Glue Data Catalog's Hive-compatibility layer
+                     does not provide for this feature).
+    --delta         Glue 5.0, spark_catalog only (compaction.py — reads
+                     and writes only the already-Delta table)
+
 Usage:
     python glue_jobs/deploy_and_run.py --job-name raw_to_iceberg \
         --script-path glue_jobs/raw_to_iceberg.py \
         --iceberg --validate-only
 
-    python glue_jobs/deploy_and_run.py --job-name raw_to_iceberg \
-        --script-path glue_jobs/raw_to_iceberg.py \
-        --iceberg --test
+    python glue_jobs/deploy_and_run.py --job-name iceberg_to_delta \
+        --script-path glue_jobs/iceberg_to_delta.py \
+        --iceberg-delta --test
 
-    python glue_jobs/deploy_and_run.py --job-name raw_to_iceberg \
-        --script-path glue_jobs/raw_to_iceberg.py \
-        --iceberg
+    python glue_jobs/deploy_and_run.py --job-name compaction \
+        --script-path glue_jobs/compaction.py \
+        --delta
 """
 
 import argparse
@@ -52,7 +67,6 @@ logger = logging.getLogger("deploy_and_run")
 
 AWS_REGION = "ap-south-1"
 S3_BUCKET = "nyc-311-lakehouse"
-GLUE_VERSION = "4.0"
 POLL_INTERVAL_SECONDS = 30
 POLL_TIMEOUT_SECONDS = 3600  # 1 hour ceiling
 
@@ -71,6 +85,39 @@ ICEBERG_CONF = (
     "--conf spark.sql.catalog.glue_catalog.io-impl=org.apache.iceberg.aws.s3.S3FileIO "
     f"--conf spark.sql.catalog.glue_catalog.warehouse=s3://{S3_BUCKET}/silver/"
 )
+
+# Pure Delta job (compaction.py) — no Iceberg catalog needed, table is
+# already Delta. spark_catalog override is required for DeltaTable.forPath
+# and OPTIMIZE/VACUUM SQL syntax to resolve.
+DELTA_CONF = (
+    "spark.sql.extensions=io.delta.sql.DeltaSparkSessionExtension "
+    "--conf spark.sql.catalog.spark_catalog=org.apache.spark.sql.delta.catalog.DeltaCatalog"
+)
+
+# iceberg_to_delta.py reads via glue_catalog (Iceberg) and writes via
+# spark_catalog (Delta) in the same job — both extension sets must be
+# registered together, comma-joined in a single spark.sql.extensions value
+# (Spark only reads the last spark.sql.extensions conf if set twice).
+ICEBERG_DELTA_CONF = (
+    "spark.sql.extensions=io.delta.sql.DeltaSparkSessionExtension,"
+    "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions "
+    "--conf spark.sql.catalog.spark_catalog=org.apache.spark.sql.delta.catalog.DeltaCatalog "
+    "--conf spark.sql.catalog.glue_catalog=org.apache.iceberg.spark.SparkCatalog "
+    "--conf spark.sql.catalog.glue_catalog.catalog-impl=org.apache.iceberg.aws.glue.GlueCatalog "
+    "--conf spark.sql.catalog.glue_catalog.io-impl=org.apache.iceberg.aws.s3.S3FileIO "
+    f"--conf spark.sql.catalog.glue_catalog.warehouse=s3://{S3_BUCKET}/silver/"
+)
+
+# glue_version per format: Delta table registration (saveAsTable) and
+# dual-catalog jobs need Glue 5.0 (Spark 3.5 / Delta 3.3.0). Pure Iceberg
+# jobs stay on Glue 4.0 — already validated on the full 19M-row load in
+# Stage 2, no reason to move it.
+FORMAT_CONFIGS = {
+    "iceberg": {"datalake_formats": "iceberg", "conf": ICEBERG_CONF, "glue_version": "4.0"},
+    "iceberg_delta": {"datalake_formats": "iceberg,delta", "conf": ICEBERG_DELTA_CONF, "glue_version": "5.0"},
+    "delta": {"datalake_formats": "delta", "conf": DELTA_CONF, "glue_version": "5.0"},
+}
+DEFAULT_GLUE_VERSION = "4.0"  # used only when no format flag is given
 
 
 def get_glue_role_arn() -> str:
@@ -103,7 +150,9 @@ def upload_script(script_path: str, job_name: str) -> str:
     return f"s3://{S3_BUCKET}/{s3_key}"
 
 
-def create_or_update_job(job_name: str, script_s3_path: str, role_arn: str, use_iceberg: bool) -> None:
+def create_or_update_job(
+    job_name: str, script_s3_path: str, role_arn: str, format_key: str | None, glue_version: str
+) -> None:
     """Create the Glue job if it doesn't exist, otherwise update it in place."""
     glue = boto3.client("glue", region_name=AWS_REGION)
 
@@ -111,9 +160,15 @@ def create_or_update_job(job_name: str, script_s3_path: str, role_arn: str, use_
         "--TempDir": f"s3://{S3_BUCKET}/glue_temp/",
         "--job-language": "python",
     }
-    if use_iceberg:
-        default_arguments["--datalake-formats"] = "iceberg"
-        default_arguments["--conf"] = ICEBERG_CONF
+    if format_key:
+        config = FORMAT_CONFIGS[format_key]
+        default_arguments["--datalake-formats"] = config["datalake_formats"]
+        default_arguments["--conf"] = config["conf"]
+        # Required for saveAsTable/CatalogTable-backed writes to resolve through
+        # AWS Glue Data Catalog as the actual Hive Metastore, not an ephemeral
+        # in-container one. Needed by any job that registers a Delta table.
+        if format_key in ("iceberg_delta", "delta"):
+            default_arguments["--enable-glue-datacatalog"] = "true"
 
     job_config = {
         "Role": role_arn,
@@ -122,7 +177,7 @@ def create_or_update_job(job_name: str, script_s3_path: str, role_arn: str, use_
             "ScriptLocation": script_s3_path,
             "PythonVersion": "3",
         },
-        "GlueVersion": GLUE_VERSION,
+        "GlueVersion": glue_version,
         "DefaultArguments": default_arguments,
         "NumberOfWorkers": 5,
         "WorkerType": "G.1X",
@@ -131,10 +186,10 @@ def create_or_update_job(job_name: str, script_s3_path: str, role_arn: str, use_
 
     try:
         glue.get_job(JobName=job_name)
-        logger.info("Job %s exists, updating definition", job_name)
+        logger.info("Job %s exists, updating definition (Glue %s)", job_name, glue_version)
         glue.update_job(JobName=job_name, JobUpdate=job_config)
     except glue.exceptions.EntityNotFoundException:
-        logger.info("Job %s does not exist, creating it", job_name)
+        logger.info("Job %s does not exist, creating it (Glue %s)", job_name, glue_version)
         glue.create_job(Name=job_name, **job_config)
 
 
@@ -235,8 +290,24 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Deploy and run a Glue job")
     parser.add_argument("--job-name", required=True, help="Glue job name, e.g. raw_to_iceberg")
     parser.add_argument("--script-path", required=True, help="Local path to the PySpark script")
+
+    format_group = parser.add_mutually_exclusive_group()
+    format_group.add_argument(
+        "--iceberg", action="store_const", const="iceberg", dest="format_key",
+        help="Iceberg confs only, Glue 4.0 (raw_to_iceberg.py)",
+    )
+    format_group.add_argument(
+        "--iceberg-delta", action="store_const", const="iceberg_delta", dest="format_key",
+        help="Both Iceberg (read) and Delta (write) confs, Glue 5.0 (iceberg_to_delta.py)",
+    )
+    format_group.add_argument(
+        "--delta", action="store_const", const="delta", dest="format_key",
+        help="Delta confs only, Glue 5.0 (compaction.py)",
+    )
+
     parser.add_argument(
-        "--iceberg", action="store_true", help="Attach required Iceberg --conf/--datalake-formats args"
+        "--glue-version", default=None,
+        help="Override the Glue version implied by the format flag (rarely needed)",
     )
     parser.add_argument(
         "--test", action="store_true", help="Pass --test through to the job script (small sample, test table)"
@@ -251,10 +322,14 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    glue_version = args.glue_version or (
+        FORMAT_CONFIGS[args.format_key]["glue_version"] if args.format_key else DEFAULT_GLUE_VERSION
+    )
+
     try:
         role_arn = get_glue_role_arn()
         script_s3_path = upload_script(args.script_path, args.job_name)
-        create_or_update_job(args.job_name, script_s3_path, role_arn, args.iceberg)
+        create_or_update_job(args.job_name, script_s3_path, role_arn, args.format_key, glue_version)
 
         job_args = {}
         if args.test:
