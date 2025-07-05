@@ -48,3 +48,41 @@
 **Context:** Glue's default retry re-runs the entire job from scratch on failure, silently re-billing DPU-hours on non-transient bugs.
 **Decision:** `deploy_and_run.py` (boto3, reusable across stages) sets `MaxRetries=0` explicitly, reads the Glue role ARN from `terraform output` (not hardcoded), and auto-fetches CloudWatch logs on failure.
 **Consequence:** Failures are visible and cheap to diagnose; no silent cost from repeated retries during active debugging.
+
+### ADR-S3-1: UniForm deferred — AWS Glue lacks a real Hive Metastore
+**Context:** Planned to enable Delta UniForm so the Delta table would also be readable as Iceberg, with zero data duplication.
+**Discovery:** Three failures fixed in turn (missing `CatalogTable` on write, empty Glue database `LocationUri`, missing `--enable-glue-datacatalog`) — but the real blocker remained: UniForm's Iceberg-conversion hook requires a literal standalone Hive Metastore Thrift service, confirmed via `docs.delta.io`. AWS Glue Data Catalog's Hive-compatibility layer, used successfully everywhere else in the project, doesn't satisfy this.
+**Decision:** Defer UniForm. Write Delta with `delta.columnMapping.mode=name` enabled (UniForm-ready, not active). No standalone HMS infrastructure added.
+**Rationale:** A minimal HMS (small EC2 + RDS) would cost ~$25–45/month to unblock a feature the actual benchmarks don't depend on — Query C's 55.7x speedup works entirely without it.
+**Consequence:** Iceberg and Delta remain independent tables sharing no metadata. Column mapping is enabled, so UniForm could be turned on later at zero migration cost.
+
+### ADR-S3-2: Glue 5.0 for Delta jobs, Glue 4.0 stays for Iceberg
+**Context:** UniForm needs Delta 3.0+, which needs Spark 3.5+. Glue 4.0 (Spark 3.3.0) bundles Delta 2.1.0 — no Delta version satisfies both requirements on Glue 4.0.
+**Decision:** `iceberg_to_delta.py`/`compaction.py` run on Glue 5.0 (Spark 3.5.4, Delta 3.3.0). `raw_to_iceberg.py` stays on Glue 4.0, unchanged.
+**Rationale:** No reason to touch an already-validated job; Iceberg's table format is version-independent, so a newer Iceberg reader opening an older writer's table is normal and supported.
+**Consequence:** Two Glue engine versions run side by side by design, not oversight.
+
+### ADR-S3-3: deploy_and_run.py's --uniform renamed to --iceberg-delta
+**Context:** The flag configures dual-catalog access (Iceberg read + Delta write) — nothing to do with UniForm once UniForm was deferred.
+**Decision:** Renamed `--uniform` → `--iceberg-delta`.
+**Rationale:** A flag named after an abandoned feature would mislead future readers of the deploy script.
+**Consequence:** No behavioral change — naming correction only.
+
+### ADR-S3-4: verify_delta.py checks Delta-reader consistency, not Delta/Iceberg parity
+**Context:** The planned `verify_uniform.py` would have proven identical row counts from a PyIceberg reader and a Delta reader on the same files — impossible once UniForm was deferred.
+**Decision:** Rewrote as `verify_delta.py`, comparing row counts from two independent Delta readers (delta-rs and DuckDB's `delta` extension) instead.
+**Rationale:** A narrower claim, but still a real check — two independent readers agreeing on the same `_delta_log` catches genuine log-replay bugs.
+**Consequence:** Verification scope is narrower than originally planned; documented rather than silently downgraded.
+
+### ADR-S3-5: Z-order compaction accepted despite increasing storage size
+**Context:** Post-compaction Delta storage (1.60 GB) is 29.3% larger than Iceberg (1.24 GB), despite Query C improving 6.2x.
+**Discovery:** Z-ordering optimizes row locality for query pruning, not storage size. Two full OPTIMIZE passes ran on this table during testing (a `--skip-optimize` flag wasn't correctly wired through one run), likely compounding the size increase.
+**Decision:** Report the increase honestly rather than reframe or hide it.
+**Rationale:** The tradeoff — storage cost for selective-query speed — is a legitimate, defensible finding, more credible than a report where every metric improved.
+**Consequence:** Storage progression (2.42 GB → 1.24 GB → 1.60 GB) is non-monotonic but real, carried into the final report as-is.
+
+### ADR-S3-6: One-off VACUUM retention override (0h), not left in committed code
+**Context:** Delta's default 168h retention correctly blocked file deletion immediately after OPTIMIZE; an accurate storage number otherwise meant waiting 7 real days.
+**Decision:** Ran `compaction.py` once with `VACUUM_RETENTION_HOURS=0` and the retention safety check disabled to force cleanup, then reverted both to the safe 168h default in the committed version.
+**Rationale:** A week's wait wasn't practical for this timeline; the override was scoped to one ad hoc run, not the standing default.
+**Consequence:** Reported storage numbers reflect an artificially early VACUUM — documented so the deviation is traceable.
