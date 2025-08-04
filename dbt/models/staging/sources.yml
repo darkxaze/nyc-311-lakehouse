@@ -1,0 +1,30 @@
+version: 2
+
+sources:
+  - name: nyc_311
+    database: NYC_311
+    schema: staging
+    tables:
+      - name: requests_delta
+        # Iceberg table via delta_catalog_integration (OBJECT_STORE,
+        # TABLE_FORMAT=DELTA) over s3://nyc-311-lakehouse/silver/311_delta/.
+        # Read-only external volume, no data copied into Snowflake.
+        # UniForm not used — see DECISIONS.md ADR on Glue/Thrift limitation.
+        description: "NYC 311 requests, Delta Lake read via Snowflake Iceberg-over-Delta catalog integration"
+        columns:
+          - name: unique_key
+            tests:
+              - not_null
+              - unique
+          - name: created_date
+            tests:
+              - not_null
+          - name: borough
+            tests:
+              # warn not fail: ~7k rows have null/blank borough (real data
+              # quality pattern). Flagged as anomaly in stg_311_requests,
+              # not filtered — consistent with resolution_days handling.
+              - accepted_values:
+                  values: ['BRONX', 'BROOKLYN', 'MANHATTAN', 'QUEENS', 'STATEN ISLAND', 'UNSPECIFIED']
+                  config:
+                    severity: warn

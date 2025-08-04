@@ -1,0 +1,25 @@
+name: nyc_311_analytics
+profile: nyc_311
+version: "1.0.0"
+config-version: 2
+
+model-paths: ["models"]
+test-paths: ["tests"]
+seed-paths: ["seeds"]
+target-path: "target"
+clean-targets: ["target", "dbt_packages"]
+
+models:
+  nyc_311_analytics:
+    staging:
+      # incremental: 19M-row source via external Iceberg-over-Delta table;
+      # full refresh would re-scan the whole thing every run
+      +materialized: incremental
+      +schema: staging
+    intermediate:
+      # ephemeral: inlined as CTE into gold, no storage/incremental state
+      +materialized: ephemeral
+    gold:
+      # table: small aggregates, cheap full rebuild, fast for BI/Superset
+      +materialized: table
+      +schema: gold

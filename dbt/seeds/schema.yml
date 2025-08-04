@@ -1,0 +1,13 @@
+version: 2
+
+seeds:
+  - name: sla_targets
+    description: "Documented NYC agency SLA targets per complaint type"
+    columns:
+      - name: complaint_type
+        tests:
+          - not_null
+          - unique
+      - name: target_days
+        tests:
+          - not_null
