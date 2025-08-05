@@ -1,0 +1,17 @@
+version: 2
+
+models:
+  - name: stg_311_requests
+    description: "Normalized boroughs/complaint types; anomalies flagged not filtered"
+    columns:
+      - name: unique_key
+        tests:
+          - not_null
+          - unique
+      - name: resolution_days
+        tests:
+          - dbt_expectations.expect_column_values_to_be_between:
+              min_value: -365
+              max_value: 3650
+              config:
+                severity: warn
