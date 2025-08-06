@@ -1,0 +1,12 @@
+version: 2
+
+models:
+  - name: fct_sla_performance
+    description: "SLA performance metrics by complaint type, agency, year"
+
+  - name: fct_sla_trends
+    description: "5-year SLA breach trend for top 10 complaint types by current breach rate"
+    columns:
+      - name: breach_rate_current
+        tests:
+          - not_null
