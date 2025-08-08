@@ -1,0 +1,29 @@
+checks for staging.stg_311_requests:
+  - row_count > 1000000:
+      name: Minimum row count check
+  - missing_count(unique_key) = 0:
+      name: No missing primary keys
+  - missing_count(created_date) = 0:
+      name: No missing created dates
+  - invalid_percent(borough) < 1%:
+      # borough nulls/blanks are flagged as anomalies upstream, not
+      # filtered — small % expected, hard 0% would be wrong here
+      valid values: [BRONX, BROOKLYN, MANHATTAN, QUEENS, STATEN ISLAND, UNSPECIFIED]
+      name: Borough values mostly valid
+  - freshness(created_date) < 30d:
+      # 30d not 3d: this is a portfolio project run ad hoc, not a live
+      # daily pipeline yet (that's Stage 5/Kestra). Catches stale source,
+      # not meant to simulate production SLA.
+      name: Data freshness check
+
+checks for gold.fct_sla_performance:
+  - row_count > 20:
+      name: Minimum aggregated rows
+  - missing_count(sla_breach_rate) = 0:
+      # after the inner-join fix, every row here has a real SLA target,
+      # so breach_rate should never be null
+      name: No missing breach rates
+  - invalid_percent(sla_breach_rate) < 5%:
+      valid min: 0
+      valid max: 1
+      name: Breach rate bounds check
