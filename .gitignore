@@ -20,6 +20,7 @@ dbt/package-lock.yml
 benchmarks/*.json
 scraps/
 Actual_build.md
+snowflake_setup/
 NYC_311_LAKEHOUSE_COMPLETE_BUILD_GUIDE.md
 nyc-311-lakehouse-dev_accessKeys.csv
 nyc-311-lakehouse-dev_credentials.csv

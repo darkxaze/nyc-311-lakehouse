@@ -86,3 +86,64 @@
 **Decision:** Ran `compaction.py` once with `VACUUM_RETENTION_HOURS=0` and the retention safety check disabled to force cleanup, then reverted both to the safe 168h default in the committed version.
 **Rationale:** A week's wait wasn't practical for this timeline; the override was scoped to one ad hoc run, not the standing default.
 **Consequence:** Reported storage numbers reflect an artificially early VACUUM — documented so the deviation is traceable.
+
+### ADR-S4-1: Snowflake trial on Asia Pacific (Singapore), accepting cross-region S3 reads
+**Context:** Project's bucket is `ap-south-1` (Mumbai); Snowflake's free trial signup doesn't offer Mumbai as a region option, though it's generally supported.
+**Decision:** Provisioned trial in Asia Pacific (Singapore) instead.
+**Rationale:** Cross-region cost on a ~1.6GB table is negligible; Stages 1-3 already own this project's storage-performance benchmark story (same-region), so Snowflake's cross-region latency doesn't undercut it.
+**Consequence:** Any Snowflake/dbt query time includes cross-region latency — not comparable to Stage 1-3's same-region Glue numbers.
+
+### ADR-S4-2: Delta read via Iceberg-over-Delta catalog integration, not COPY INTO
+**Context:** Needed Snowflake to query the Stage 3 Delta table without UniForm (deferred, ADR-S3-1).
+**Options considered:** Legacy `EXTERNAL TABLE ... TABLE_FORMAT=DELTA` (Snowflake-deprecation-flagged); `CREATE ICEBERG TABLE` over an external volume + catalog integration; `COPY INTO` a native table.
+**Decision:** External volume + catalog integration (`CATALOG_SOURCE=OBJECT_STORE`, `TABLE_FORMAT=DELTA`).
+**Rationale:** COPY INTO would duplicate ~19M rows into Snowflake and undercut the lakehouse-vs-warehouse narrative; the legacy path is deprecation-flagged.
+**Consequence:** S3 stays the single source of truth, read-only (`ALLOW_WRITES=FALSE`). Direct cause of ADR-S4-9's incremental-compute finding.
+
+### ADR-S4-3: Dedicated IAM role for Snowflake, not reused from Glue
+**Context:** Snowflake's external volume needs an assumable AWS role.
+**Decision:** New role `snowflake-nyc311-delta-role`, read-only, scoped to `silver/311_delta/*` — not the existing Glue job role.
+**Rationale:** Glue's trust policy is scoped to the Glue service principal; mixing purposes on one role is harder to reason about and rotate.
+**Consequence:** Two roles to manage. Trust policy must be re-synced any time the external volume is recreated (Stage 4 bug #1).
+
+### ADR-S4-4: Inner join to sla_targets, not left join
+**Context:** `int_requests_enriched.sql` originally left-joined to the `sla_targets` seed, per the guide's template.
+**Decision:** Changed to `INNER JOIN`.
+**Rationale:** Complaint types with no seeded SLA target produced NULL breach rates that ranked first in Snowflake's default `DESC` sort (NULLs-first), corrupting `fct_sla_trends`' top-10 (bug #6). A type with no target has nothing to breach.
+**Consequence:** Gold models only contain complaint types present in both the seed and the real data.
+
+### ADR-S4-5: 2021–2025 window enforced in fct_sla_trends.sql, not just documented
+**Context:** The locked 2021-2025 trend scope existed as stated intent but wasn't implemented as a filter in the gold model.
+**Decision:** Capped `most_recent_year` at `<= 2025` directly in the model.
+**Rationale:** Unbounded `MAX(calendar_year)` resolved to 2026 — mostly-NULL breach rates from a partial year broke the ranking (bug #5).
+**Consequence:** 2026 stays available in `fct_sla_performance`; only `fct_sla_trends`' ranking is bounded.
+
+### ADR-S4-6: Custom schema-naming macro; no default schema in Soda config
+**Context:** dbt and Soda both produced doubled schema names (`staging_gold`, `staging.staging`) from the same root cause — concatenating a connection-level default schema with an already-qualified model/check schema.
+**Decision:** Added `macros/generate_schema_name.sql` to use a model's configured schema as-is; removed the default `schema` key from Soda's connection YAML.
+**Rationale:** Both tools' default "helpful" concatenation actively fights explicit, fully-qualified naming.
+**Consequence:** Schemas now resolve exactly to `staging`/`gold` as intended.
+
+### ADR-S4-7: Built against Soda Core 3.3.0's real API, not the guide's assumed methods
+**Context:** The guide's `run_checks.py` calls `add_snowflake_connection()`, `get_checks_pass()`, `get_checks_pass_count()` — none exist in the installed 3.3.0 (three sequential `AttributeError`s).
+**Decision:** Rewrote using `add_configuration_yaml_str()` and `has_check_fails()`/`get_checks_fail()` — the real API surface.
+**Rationale:** No working alternative; fix forward against what's actually installed.
+**Consequence:** Pass-count logging relies on Soda's own stdout scan summary, since no programmatic pass-count method exists in this version.
+
+### ADR-S4-8: Real finding (Elevator, ~80-93% breach) reported instead of the guide's fabricated HEAT/HOT WATER number
+**Context:** The guide's `CLAUDE.md` template pre-specifies a target finding (HEAT/HOT WATER "worsening" 23.4%→31.7%) that was never a measured result.
+**Decision:** Report the real measured finding instead — HEAT/HOT WATER is actually improving (1.28%→0.43%); HPD Elevator's near-total, flat-to-worsening breach rate is the real headline.
+**Rationale:** Matches this project's stated standard: every claim measured, not estimated.
+**Consequence:** README/resume language should use the Elevator finding, not the guide's placeholder.
+
+### ADR-S4-9: dbt incremental strategy doesn't reduce total pipeline compute here — reported as measured
+**Context:** `dbt_performance.py` measured full-refresh vs. incremental bytes scanned, expecting a reduction per the guide's assumed target.
+**Decision:** Reported the real result: incremental scanned **more** bytes (+22.1%), not less.
+**Rationale:** The incremental filter still requires scanning the full external Iceberg-over-Delta source to evaluate (Snowflake can't push pruning through the catalog-integration layer, ADR-S4-2); both gold tables also fully rebuild every run regardless of staging's incrementality.
+**Consequence:** A pruning-capable native Snowflake source would likely change this result — not tested, out of scope. Documented as an architecture-specific limitation, not a general claim against dbt incrementality.
+
+### ADR-S4-10: Normalization fallback fixed to UPPER(TRIM()); seed's BROKEN MUNI METER corrected to match real taxonomy
+**Context:** 3 of 10 seeded complaint types were missing from all gold output.
+**Decision:** Changed the staging model's `ELSE complaint_type` fallback to `ELSE UPPER(TRIM(complaint_type))`; added exact-match rules for `Street Condition`/`Sidewalk Condition`; mapped the real `Broken Parking Meter` to the seed's `BROKEN MUNI METER` key.
+**Rationale:** Real volume existed under mixed-case source strings that never matched the seed's uppercase keys; `BROKEN MUNI METER` doesn't exist in NYC's actual complaint-type taxonomy at all (guide error).
+**Consequence:** All 10 types now surface. Side effect: the same case-sensitivity bug had also been silently excluding some Elevator rows — pre-fix numbers (95-97%) were on an incomplete slice; post-fix numbers (80-93%) are correct.
