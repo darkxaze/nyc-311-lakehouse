@@ -1,0 +1,146 @@
+# Local dev only. Airflow: http://localhost:8080 (airflow/airflow after airflow-init).
+# Superset: http://localhost:8088 (admin/admin).
+#
+# LocalExecutor, not the official CeleryExecutor quick-start: single-developer
+# local setup doesn't need Celery/Redis/multiple workers -- same reasoning as
+# Superset's local-only config below. Airflow 3 still runs dag-processor as a
+# separate service (unlike 2.x, where it could run embedded in the scheduler).
+
+x-airflow-common:
+  &airflow-common
+  image: nyc-311-airflow:latest
+  # built manually with:
+  #   docker build -f Dockerfile.airflow -t nyc-311-airflow:latest .
+  # No build: key here -- Compose's parallel per-service builds race to
+  # write the same shared image tag simultaneously and corrupt it
+  # ("already exists" failures, then ModuleNotFoundError: no module
+  # named 'airflow' at runtime). Building once, outside Compose, avoids
+  # the race entirely.
+  environment:
+    &airflow-common-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres_airflow/airflow
+    AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+    # Airflow 3's Task Execution API: every task process calls back to the
+    # api-server over HTTP. Default is localhost:8080, which inside the
+    # scheduler container means the scheduler itself, not the separate
+    # airflow-api-server container -- causes every task to fail instantly
+    # with httpx.ConnectError: [Errno 111] Connection refused.
+    AIRFLOW__CORE__EXECUTION_API_SERVER_URL: 'http://airflow-api-server:8080/execution/'
+    # Shared JWT secret across scheduler/api-server/dag-processor. Without
+    # this, each service generates its own random secret independently --
+    # tokens signed by the scheduler fail signature verification at the
+    # api-server (jwt.exceptions.InvalidSignatureError), since they're
+    # different keys. Fine as a fixed dev value for local-only use; would
+    # need to be a real secret (env var, not committed) for anything else.
+    AIRFLOW__API_AUTH__JWT_SECRET: 'nyc-311-lakehouse-local-dev-jwt-secret-not-for-production-use'
+    # no AIRFLOW__API__AUTH_BACKENDS override -- that's an Airflow 2.x-era
+    # config key; forcing it appears to route through the same buggy FAB
+    # code path as `airflow users create` (see airflow-init below).
+    # Airflow 3's default auth manager (Simple Auth Manager) handles this.
+    # project env vars, same .env used by dbt/soda/ingestion scripts
+    AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
+    AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
+    AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION}
+    SNOWFLAKE_ACCOUNT: ${SNOWFLAKE_ACCOUNT}
+    SNOWFLAKE_USER: ${SNOWFLAKE_USER}
+    SNOWFLAKE_PASSWORD: ${SNOWFLAKE_PASSWORD}
+    SNOWFLAKE_ROLE: ${SNOWFLAKE_ROLE}
+    SNOWFLAKE_DATABASE: ${SNOWFLAKE_DATABASE}
+    SNOWFLAKE_SCHEMA: ${SNOWFLAKE_SCHEMA}
+    SNOWFLAKE_WAREHOUSE: ${SNOWFLAKE_WAREHOUSE}
+  volumes:
+    - ${AIRFLOW_PROJ_DIR:-.}/airflow/dags:/opt/airflow/dags
+    - ${AIRFLOW_PROJ_DIR:-.}/airflow/logs:/opt/airflow/logs
+    - ${AIRFLOW_PROJ_DIR:-.}/airflow/plugins:/opt/airflow/plugins
+    # mount the whole project so DAGs can shell out to existing scripts
+    # (ingestion/, dbt/, soda/) without duplicating them into airflow/
+    - ${AIRFLOW_PROJ_DIR:-.}:/opt/project
+  user: "${AIRFLOW_UID:-50000}:0"
+  depends_on:
+    &airflow-common-depends-on
+    postgres_airflow:
+      condition: service_healthy
+
+services:
+
+  postgres_airflow:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - postgres_airflow_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 10s
+      retries: 5
+      start_period: 5s
+    restart: always
+
+  airflow-init:
+    <<: *airflow-common
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - airflow db migrate
+    # No `airflow users create` here -- that command hits a currently-open
+    # upstream bug in 3.3.1 (apache/airflow#51304, AttributeError:
+    # 'AirflowSecurityManagerV2' object has no attribute 'find_role').
+    # Airflow 3's Simple Auth Manager auto-creates an admin user with a
+    # random password on first api-server startup instead -- check
+    # `docker compose logs airflow-api-server` for it after `up -d`.
+    environment:
+      <<: *airflow-common-env
+
+  airflow-dag-processor:
+    <<: *airflow-common
+    command: dag-processor
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-scheduler:
+    <<: *airflow-common
+    command: scheduler
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-api-server:
+    <<: *airflow-common
+    command: api-server
+    ports:
+      - "8080:8080"
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  superset:
+    build:
+      context: .
+      dockerfile: Dockerfile.superset
+    ports:
+      - "8088:8088"
+    environment:
+      SUPERSET_CONFIG_PATH: /app/superset_config.py
+      SUPERSET_SECRET_KEY: change_me_in_production
+    volumes:
+      - ./superset/superset_config.py:/app/superset_config.py
+      - superset_data:/app/superset_home
+    command: >
+      bash -c "superset db upgrade &&
+               superset fab create-admin --username admin --firstname Admin --lastname Admin --email admin@superset.com --password admin &&
+               superset init &&
+               superset run -h 0.0.0.0 -p 8088"
+
+volumes:
+  postgres_airflow_data:
+  superset_data:

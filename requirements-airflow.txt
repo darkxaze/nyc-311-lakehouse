@@ -1,0 +1,19 @@
+# Subset of requirements.txt -- only what airflow DAG tasks actually shell
+# out to or call directly (ingestion/, dbt/, soda/, boto3 in the DAGs
+# themselves). Deliberately excludes polars/duckdb/pyspark/pyiceberg/
+# deltalake/snowflake-connector-python -- those are used by local
+# benchmark/analysis scripts the DAGs never invoke.
+#
+# boto3/python-dotenv/requests left unpinned: Airflow's own
+# apache-airflow-providers-amazon bundles boto3 too, and the constraints
+# file (Dockerfile.airflow) pins it to a specific version -- an exact ==
+# pin here would conflict with that pin and fail to resolve. dlt/dbt/soda
+# aren't part of Airflow's own dependency tree, so their pins hold.
+dlt[filesystem]==1.4.0
+boto3
+python-dotenv
+requests
+dbt-core==1.7.4
+dbt-snowflake==1.7.4
+soda-core==3.3.0
+soda-core-snowflake==3.3.0

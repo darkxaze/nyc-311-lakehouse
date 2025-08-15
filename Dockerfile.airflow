@@ -1,0 +1,33 @@
+# Extends the base Airflow image with this project's dependencies (dlt, boto3,
+# dbt, soda-core) so DAG tasks can shell out to existing scripts directly.
+#
+# Pinned to -python3.11: the plain apache/airflow:3.3.1 tag currently
+# defaults to Python 3.13, which dlt==1.4.0 doesn't support
+# (Requires-Python <3.13). 3.11 is safely compatible with every pin in
+# requirements.txt.
+FROM apache/airflow:3.3.1-python3.11
+COPY requirements-airflow.txt /requirements-airflow.txt
+
+# Two-stage install: dlt/boto3/python-dotenv/requests genuinely share
+# dependencies with Airflow's own FAB/security-manager stack, so they're
+# installed WITH the constraints file to avoid corrupting it (this is
+# what fixed the earlier AttributeError: find_role bug). dbt/soda share
+# nothing with that stack -- dbt-core 1.7.4 requires pathspec<0.12,
+# which directly conflicts with the constraints file's much newer pin,
+# an unrelated-package version fight not worth having. Installed
+# separately, unconstrained.
+RUN grep -E "^(dlt|boto3|python-dotenv|requests)" /requirements-airflow.txt > /tmp/requirements-airflow-constrained.txt && \
+    pip install --no-cache-dir -r /tmp/requirements-airflow-constrained.txt \
+    --constraint "https://raw.githubusercontent.com/apache/airflow/constraints-3.3.1/constraints-3.11.txt"
+
+# dlt's import chain (dlt.pipeline.dbt -> dlt.helpers.dbt) unconditionally
+# imports pkg_resources at load time, even though this project never uses
+# dlt's dbt-helper feature. Whatever setuptools version Airflow's
+# constraints file pins no longer bundles pkg_resources. Installed as its
+# own separate step (not constrained), so it can't reintroduce a version
+# fight with the constraints file above -- constraints only apply within
+# the pip invocation they're passed to.
+RUN pip install --no-cache-dir "setuptools==70.3.0"
+
+RUN grep -E "^(dbt|soda)" /requirements-airflow.txt > /tmp/requirements-airflow-unconstrained.txt && \
+    pip install --no-cache-dir -r /tmp/requirements-airflow-unconstrained.txt
