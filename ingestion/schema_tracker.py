@@ -1,12 +1,11 @@
 """
 NYC 311 Socrata API schema drift detector.
 
-Runs first in every pipeline execution (see Kestra flow in Stage 5):
-schema changes from Socrata are rare but not impossible, and detecting
-them BEFORE ingestion runs prevents silently writing schema-incompatible
-records into the raw layer. This is the first line of defence; dbt's
-on_schema_change='fail' (Stage 4) is the second line, in case something
-slips past this check.
+Runs first in every pipeline execution: schema changes from Socrata are
+rare but not impossible, and detecting them BEFORE ingestion runs prevents
+silently writing schema-incompatible records into the raw layer. This is
+the first line of defence; dbt's on_schema_change='fail' (Stage 4) is the
+second line, in case something slips past this check.
 
 Breaking change = column removed, or column type changed.
 Non-breaking change = new optional column added.
@@ -35,12 +34,28 @@ logger = logging.getLogger(__name__)
 API_ENDPOINT = "https://data.cityofnewyork.us/resource/erm2-nwe9.json"
 SCHEMA_S3_KEY = "metadata/311_schema.json"
 
+# Real-world evidence for why 1 isn't enough: a single sample sometimes
+# omits sparse-but-real fields entirely (e.g. an intersection-based
+# complaint has no incident_address/street_name/bbl at all, since Socrata
+# drops null keys from the JSON rather than including them as null).
+# Sampling many records and unioning their keys avoids false "removed
+# column" positives. Caught live in Stage 5's first real DAG run: a
+# single-record sample flagged bbl/cross_street_1/cross_street_2/
+# incident_address/landmark/location_type/street_name as "removed" when
+# they were simply absent from that one row.
+SCHEMA_SAMPLE_SIZE = 100
+
 
 def fetch_current_schema() -> dict[str, str]:
-    """Fetch one record from the API and derive a {column_name: python_type}
-    schema from it. Socrata doesn't expose a clean schema endpoint for this
-    dataset via SoQL, so we infer types from a live sample record instead —
-    simpler and more honest than trusting stale API documentation.
+    """Fetch multiple records from the API and derive a
+    {column_name: python_type} schema from the union of keys across all of
+    them. Socrata doesn't expose a clean schema endpoint for this dataset
+    via SoQL, so we infer types from live sample records instead — simpler
+    and more honest than trusting stale API documentation. A single record
+    is not enough: different complaint types populate different subsets of
+    optional fields (address vs. intersection-based complaints, phone vs.
+    online submissions), so a one-row sample can look like columns were
+    removed when they're just sparse.
     """
     token = os.getenv("NYC_OPEN_DATA_APP_TOKEN")
     headers = {"X-App-Token": token} if token else {}
@@ -48,7 +63,7 @@ def fetch_current_schema() -> dict[str, str]:
     try:
         resp = requests.get(
             API_ENDPOINT,
-            params={"$limit": 1},
+            params={"$limit": SCHEMA_SAMPLE_SIZE, "$order": "created_date DESC"},
             headers=headers,
             timeout=30,
         )
@@ -63,17 +78,47 @@ def fetch_current_schema() -> dict[str, str]:
             f"API returned zero records from {API_ENDPOINT}; cannot derive schema."
         )
 
-    sample = records[0]
-    return {key: type(value).__name__ for key, value in sample.items()}
+    # union keys across all sampled records; first non-null value seen
+    # for each key determines its inferred type. Skip Socrata's own
+    # platform-computed metadata columns (":"-prefixed keys, e.g.
+    # ":@computed_region_f5dn_yrer") -- these are geo-lookup fields
+    # Socrata computes internally, not real dataset columns. They're
+    # sparse (only present when a row has valid coordinates) and never
+    # read by this project's ingestion/transform code, so comparing them
+    # for "breaking changes" produces false positives, not real drift.
+    # Caught live in Stage 5: a 100-record sample still flagged all four
+    # as "removed" simply because none of that sample had them.
+    schema: dict[str, str] = {}
+    for record in records:
+        for key, value in record.items():
+            if key.startswith(":"):
+                continue
+            if key not in schema:
+                schema[key] = type(value).__name__
+
+    logger.info(
+        "Derived schema from %d sampled records (%d columns found).",
+        len(records),
+        len(schema),
+    )
+    return schema
 
 
 def load_schema(bucket: str, s3_key: str) -> Optional[dict[str, str]]:
     """Read the previously saved schema from S3. Returns None if it
-    doesn't exist yet (first-ever run)."""
+    doesn't exist yet (first-ever run).
+
+    Filters out ":"-prefixed keys even on the saved schema -- a baseline
+    saved before this filter existed may still contain Socrata's
+    computed-region columns, which would otherwise look like a false
+    "removed" diff against a freshly-filtered fetch. Filtering both sides
+    symmetrically lets old baselines self-heal without a manual S3 reset.
+    """
     s3 = boto3.client("s3", region_name=os.getenv("AWS_DEFAULT_REGION"))
     try:
         response = s3.get_object(Bucket=bucket, Key=s3_key)
-        return json.loads(response["Body"].read())
+        schema = json.loads(response["Body"].read())
+        return {k: v for k, v in schema.items() if not k.startswith(":")}
     except ClientError as exc:
         error_code = exc.response.get("Error", {}).get("Code", "")
         if error_code in ("NoSuchKey", "404"):

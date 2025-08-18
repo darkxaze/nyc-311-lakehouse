@@ -45,13 +45,21 @@ write_disposition="merge" here silently falls back to "append" (dlt logs
 a warning). This means:
   - Real deduplication on unique_key only happens at the Iceberg stage
     (Stage 2), which supports genuine MERGE INTO.
-  - Re-running --test or --incremental against an already-loaded window
-    WILL append duplicate rows to the raw layer. The year-level
-    checkpoint is what prevents duplicates during a --full-load run;
-    it does NOT protect ad-hoc --test/--incremental re-runs.
+  - Re-running --test/--incremental/--start-date+--end-date against an
+    already-loaded window WILL append duplicate rows to the raw layer.
+    The year-level checkpoint is what prevents duplicates during a
+    --full-load run; it does NOT protect ad-hoc re-runs of the other modes.
   - This is acceptable medallion-architecture behaviour (raw = append-only
     landing zone, silver = deduped) but must be an intentional, documented
     choice, not a surprise.
+
+NOTE on --start-date/--end-date: added for Stage 5's backfill DAG, which
+needs to re-pull an arbitrary historical range on demand (e.g. after a
+compaction/schema incident). Reuses fetch_311_data_range (the same
+resource --test already used for its fixed Jan 2024 smoke-test window) --
+no new fetch logic, just parameterized dates. No checkpointing, matching
+--test's existing behaviour: a backfill is a deliberate, supervised
+one-off run, not something that needs crash-resume.
 """
 
 import argparse
@@ -223,10 +231,12 @@ def fetch_311_data(years: list[int]) -> Iterator[dict]:
         "status": {"data_type": "text"},
     },
 )
-def fetch_311_data_test_window(start: str, end: str) -> Iterator[dict]:
-    """Smoke-test resource: pulls a fixed date window, no checkpointing.
-    Mirrors scraps/test_pagination.py exactly so output is directly
-    comparable to the validated 287,186-row / 6-page result. Uses the
+def fetch_311_data_range(start: str, end: str) -> Iterator[dict]:
+    """Arbitrary date-range pull, no checkpointing. Originally written as a
+    fixed-window smoke test (--test, matching the validated 287,186-row /
+    6-page scraps/test_pagination.py result); now also used for real
+    on-demand backfills via --start-date/--end-date, since the pagination
+    logic is identical either way -- only the window differs. Uses the
     same resource `name` as fetch_311_data so it lands in the same dlt
     table rather than creating a separate one.
     """
@@ -248,7 +258,7 @@ def fetch_311_data_test_window(start: str, end: str) -> Iterator[dict]:
 
         records = _request_with_backoff(params, headers)
         if not records:
-            logger.info("Test window page %d: empty, stopping.", page)
+            logger.info("Date range page %d: empty, stopping.", page)
             break
 
         for record in records:
@@ -256,13 +266,13 @@ def fetch_311_data_test_window(start: str, end: str) -> Iterator[dict]:
 
         total += len(records)
         last_date, last_key = records[-1]["created_date"], records[-1]["unique_key"]
-        logger.info("Test window page %d: %d rows, total %d", page, len(records), total)
+        logger.info("Date range page %d: %d rows, total %d", page, len(records), total)
 
         if len(records) < PAGE_SIZE:
             break
         page += 1
 
-    logger.info("Test window complete: %d rows (expect 287,186).", total)
+    logger.info("Date range complete: %d rows (%s to %s).", total, start, end)
 
 
 def build_pipeline() -> dlt.Pipeline:
@@ -316,7 +326,20 @@ def main() -> None:
     parser.add_argument("--test", action="store_true",
                          help="Smoke test: pull Jan 2024 only, matches validated "
                               "scraps/test_pagination.py run (expect 287,186 rows)")
+    parser.add_argument("--start-date", type=str, default=None,
+                         help="Backfill start date, YYYY-MM-DD (requires --end-date)")
+    parser.add_argument("--end-date", type=str, default=None,
+                         help="Backfill end date, YYYY-MM-DD, exclusive (requires --start-date)")
     args = parser.parse_args()
+
+    if bool(args.start_date) != bool(args.end_date):
+        parser.error("--start-date and --end-date must be provided together")
+
+    if args.start_date and args.end_date:
+        start_dt = datetime.strptime(args.start_date, "%Y-%m-%d")
+        end_dt = datetime.strptime(args.end_date, "%Y-%m-%d")
+        if end_dt <= start_dt:
+            parser.error("--end-date must be after --start-date")
 
     pipeline = build_pipeline()
     start = time.perf_counter()
@@ -324,10 +347,20 @@ def main() -> None:
     try:
         if args.test:
             load_info = pipeline.run(
-                fetch_311_data_test_window("2024-01-01T00:00:00", "2024-02-01T00:00:00"),
+                fetch_311_data_range("2024-01-01T00:00:00", "2024-02-01T00:00:00"),
                 loader_file_format=LOADER_FILE_FORMAT,
             )
             logger.info("Load info: %s", load_info)
+
+        elif args.start_date and args.end_date:
+            start_iso = f"{args.start_date}T00:00:00"
+            end_iso = f"{args.end_date}T00:00:00"
+            logger.info("Backfill: %s to %s", start_iso, end_iso)
+            load_info = pipeline.run(
+                fetch_311_data_range(start_iso, end_iso),
+                loader_file_format=LOADER_FILE_FORMAT,
+            )
+            logger.info("Backfill load info: %s", load_info)
 
         elif args.full_load:
             # One pipeline.run() per year: keeps dlt's own load packages
@@ -349,7 +382,10 @@ def main() -> None:
             logger.info("Load info: %s", load_info)
 
         else:
-            parser.error("Specify --full-load, --incremental, or --test")
+            parser.error(
+                "Specify --full-load, --incremental, --test, "
+                "or --start-date/--end-date"
+            )
             return
 
     except requests.exceptions.RequestException as exc:
