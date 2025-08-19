@@ -1,0 +1,12 @@
+# Extends the base Superset image with the Snowflake driver -- not
+# included by default (confirmed via `pip show snowflake-sqlalchemy`
+# returning "not found" on the plain apache/superset:3.0.0 image).
+FROM apache/superset:3.0.0
+USER root
+RUN pip install --no-cache-dir snowflake-sqlalchemy
+# snowflake-sqlalchemy pulls in a newer cryptography that conflicts with
+# apache-superset's own pin (cryptography<40,>=39.0.1) -- confirmed via
+# pkg_resources.DistributionNotFound at container startup. Pin it back
+# to Superset's supported range explicitly, as a separate step.
+RUN pip install --no-cache-dir "cryptography<40,>=39.0.1"
+USER superset
