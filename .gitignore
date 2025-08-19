@@ -51,3 +51,4 @@ CONTEXT.md
 .ai/
 .aider*
 
+airflow/logs/
