@@ -147,3 +147,159 @@
 **Decision:** Changed the staging model's `ELSE complaint_type` fallback to `ELSE UPPER(TRIM(complaint_type))`; added exact-match rules for `Street Condition`/`Sidewalk Condition`; mapped the real `Broken Parking Meter` to the seed's `BROKEN MUNI METER` key.
 **Rationale:** Real volume existed under mixed-case source strings that never matched the seed's uppercase keys; `BROKEN MUNI METER` doesn't exist in NYC's actual complaint-type taxonomy at all (guide error).
 **Consequence:** All 10 types now surface. Side effect: the same case-sensitivity bug had also been silently excluding some Elevator rows — pre-fix numbers (95-97%) were on an incomplete slice; post-fix numbers (80-93%) are correct.
+
+
+### ADR-S5-1: Airflow 3.x, not 2.x
+**Context:** Airflow 2 reached end-of-life April 2026 — already 4 months past at
+build time.
+**Decision:** Built on Airflow 3.3.1.
+**Rationale:** Building fresh on already-unsupported software would signal
+stale practice, not current competence. Verified current 3.x docs (webserver
+split into api-server, new Task Execution API, `airflow.sdk` imports) before
+writing any DAG code, since most existing tutorials still skew toward 2.x
+syntax.
+**Consequence:** Real syntax drift from 2.x cost real debugging time (see
+actual_build.md bugs #10-#11 — the Task Execution API's server URL and shared
+JWT secret requirements are new in 3.x).
+
+### ADR-S5-2: LocalExecutor, no Celery/Redis
+**Context:** Airflow's official quick-start docker-compose defaults to
+CeleryExecutor with Redis and multiple worker containers.
+**Decision:** LocalExecutor, single Postgres for metadata, no Celery/Redis/
+worker/triggerer services.
+**Rationale:** Single-developer local setup doesn't need distributed task
+execution — same reasoning already applied to Superset's local-only config in
+the original guide.
+**Consequence:** Simpler compose file, fewer moving parts, but not a pattern
+that would scale to production multi-worker use without reintroducing Celery.
+
+### ADR-S5-3: Airflow image built once manually, not via Compose's parallel build
+**Context:** `x-airflow-common` originally had a `build:` key with a shared
+`image:` tag; Compose's newer "bake" builder races multiple services trying to
+build and tag the same image simultaneously.
+**Decision:** Removed `build:` from the compose file. Image built once via a
+plain `docker build -f Dockerfile.airflow -t nyc-311-airflow:latest .`
+outside Compose; every service references the pre-built `image:` only.
+**Rationale:** The parallel-build race left a corrupted image behind
+(`ModuleNotFoundError: No module named 'airflow'` despite a clean build log) —
+confirmed by isolating the same image via plain `docker run`, which worked
+fine. Building once, outside Compose's parallel path, avoids the race
+entirely.
+**Consequence:** Requires an extra manual build step before `docker compose up`
+rather than a single command; acceptable for local dev.
+
+### ADR-S5-4: AIRFLOW_UID pinned to the image's own baked-in user (50000), not the host UID
+**Context:** Airflow's standard advice sets `AIRFLOW_UID` to the host user's UID,
+to avoid mounted-volume files being owned by an unexpected user.
+**Decision:** Set `AIRFLOW_UID=50000` instead, matching the base image's own
+`airflow` user.
+**Rationale:** The custom Dockerfile's `pip install` runs during image build as
+UID 50000 (the image's own default), and that user owns everything under
+`/home/airflow/.local`. Running the container at a different UID at runtime
+(the host's, e.g. 1000) couldn't cleanly see those installed packages —
+confirmed by isolating `--user` and `--entrypoint` overrides independently,
+neither alone reproduced the failure; only the real UID mismatch did.
+**Consequence:** Mounted log/DAG files are owned by UID 50000 inside the
+container rather than the host user — a real tradeoff of the standard advice,
+acceptable for a single-developer local setup.
+
+### ADR-S5-5: Two-stage pip install in Dockerfile.airflow — constrained vs. unconstrained
+**Context:** Installing the full `requirements.txt` unconstrained conflicted
+with Airflow's own pins (`polars`, `boto3`); using Airflow's constraints file
+for everything then conflicted with `dbt-core`'s own `pathspec` pin.
+**Decision:** Created `requirements-airflow.txt` (only what DAG tasks actually
+invoke). Split its install: `dlt`/`boto3`/`python-dotenv`/`requests` *with*
+Airflow's constraints file; `dbt`/`soda` *without*, in a separate step.
+**Rationale:** No single strategy satisfied both Airflow's pins and this
+project's tooling — splitting by actual dependency overlap resolved it.
+**Consequence:** Two `RUN` layers instead of one; `setuptools` also needed a
+third, separate unconstrained pin after the constrained stage broke `dlt`'s
+import chain (actual_build.md bug #9).
+
+### ADR-S5-6: Explicit shared EXECUTION_API_SERVER_URL and JWT_SECRET across all Airflow services
+**Context:** Airflow 3's new Task Execution API requires every task process to
+call back to the api-server over HTTP, signed with a JWT. Neither has a
+sensible default in a multi-container Compose deployment.
+**Decision:** Set `AIRFLOW__CORE__EXECUTION_API_SERVER_URL=
+http://airflow-api-server:8080/execution/` and one fixed
+`AIRFLOW__API_AUTH__JWT_SECRET` value across every service in `x-airflow-common`.
+**Rationale:** The default execution API URL (`localhost:8080`) resolves to the
+wrong container from inside the scheduler; with no shared JWT secret, each
+service independently generates its own random one, so tokens signed by one
+service fail verification at another. Both are real, documented requirements
+for Airflow 3's split-service architecture, not a workaround.
+**Consequence:** The JWT secret is a static local-dev value; would need to be a
+real, non-committed secret for any non-local deployment.
+
+### ADR-S5-7: Skip `airflow users create`, rely on Simple Auth Manager
+**Context:** `airflow users create` fails with `AttributeError:
+'AirflowSecurityManagerV2' object has no attribute 'find_role'`.
+**Decision:** Confirmed via web search this is a genuine, currently-open
+upstream bug (`apache/airflow#51304`) — reproduced identically on a clean,
+constraints-respecting rebuild. Dropped CLI user-creation entirely; Airflow 3's
+Simple Auth Manager auto-generates an admin user on first `api-server`
+startup, printed to its own logs.
+**Rationale:** No official patch exists for this release; the workaround uses
+Airflow's own built-in mechanism, not a manual DB edit.
+**Consequence:** Auth credentials are auto-generated, read from container logs
+on first startup — fine for local dev, not for a scripted deployment.
+
+### ADR-S5-8: refresh_snowflake_iceberg_metadata task added between compaction and dbt
+**Context:** Glue's `VACUUM` (part of `run_compaction`) deletes old Parquet
+files; Snowflake's Iceberg-over-Delta catalog integration (ADR-S4-2) can hold a
+stale cached manifest still pointing at a file that was just deleted, causing
+`dbt run` to fail with "parquet file ... was inaccessible."
+**Decision:** Added a dedicated task calling `ALTER ICEBERG TABLE ... REFRESH`
+via `snowflake-connector-python`, placed between `run_compaction` and `run_dbt`
+in both DAGs.
+**Rationale:** Confirmed live — the referenced file was genuinely gone from S3
+(direct `aws s3 ls` returned empty), and the manual `REFRESH` command
+immediately fixed the same query that had failed identically on retry.
+**Consequence:** Adds a small, cheap step to every run; without it, the
+compaction → dbt sequence has a real, reproducible race condition inherent to
+this architecture.
+
+### ADR-S5-9: schema_tracker.py — multi-record sampling, symmetric Socrata metadata exclusion
+**Context:** Single-record schema inference (Stage 1's original design)
+produced two rounds of false-positive "breaking schema change" detections on
+live data: real-but-sparse address fields absent from one sampled row, then
+Socrata's own platform-computed `:@computed_region_*` columns.
+**Decision:** Sample 100 records and union their keys instead of one. Exclude
+any `:`-prefixed key (Socrata's convention for system/computed metadata, not
+real dataset columns) from the comparison — applied symmetrically to both the
+freshly-fetched schema and the previously-saved baseline, so an old baseline
+captured before this filter existed can self-heal without a manual S3 reset.
+**Rationale:** Confirmed both false positives directly against the live API
+(`curl` sampling showed the fields present on other real records); the
+computed-region columns are never read by any of this project's own transform
+code regardless.
+**Consequence:** Slightly higher per-run API cost (100 records instead of 1,
+still negligible); the schema-drift check is now meaningfully more reliable
+against Socrata's real, sparse-by-design data shape.
+
+### ADR-S5-10: dlt_311_pipeline.py backfill support reuses the existing test-window resource
+**Context:** The backfill DAG assumed `--start-date`/`--end-date` flags that had
+never actually been implemented in `dlt_311_pipeline.py`.
+**Decision:** Generalized the script's existing fixed-window `--test` resource
+(`fetch_311_data_test_window`, renamed `fetch_311_data_range`) into a real
+parameterized mode, rather than writing new fetch/pagination logic.
+**Rationale:** The pagination pattern was already validated against a known
+result (287,186 rows / Jan 2024); only the hardcoded window needed to become
+configurable — reusing it avoids re-deriving correctness from scratch.
+**Consequence:** No checkpointing on ad hoc backfills (matches `--test`'s
+existing behavior) — a backfill is treated as a deliberate, supervised one-off
+run, not something needing crash-resume.
+
+### ADR-S5-11: Custom Dockerfile.superset for the Snowflake driver
+**Context:** `snowflake-sqlalchemy` isn't included in the base
+`apache/superset:3.0.0` image; installing it pulled in a `cryptography` version
+conflicting with Superset's own pin, crashing the container at startup.
+**Decision:** Custom `Dockerfile.superset` installs the driver, then explicitly
+reinstalls `cryptography` back into Superset's supported range as a separate
+step immediately after.
+**Rationale:** Same two-stage pattern as `Dockerfile.airflow` — install the
+thing that needs a newer shared dependency, then pin that dependency back down
+for the packages that need the older range.
+**Consequence:** One more image to build and maintain locally; the fix is
+narrow and specific to this exact version combination, worth re-checking if
+either Superset or snowflake-sqlalchemy is ever upgraded.
